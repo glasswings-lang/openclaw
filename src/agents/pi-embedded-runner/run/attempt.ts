@@ -252,6 +252,7 @@ import {
   shouldWarnEmbeddedRunStageSummary,
 } from "./attempt-stage-timing.js";
 import { buildAttemptSystemPrompt } from "./attempt-system-prompt.js";
+import { getColdToolIndexForSession } from "../../tool-lookup.js";
 import {
   assembleAttemptContextEngine,
   buildLoopPromptCacheInfo,
@@ -991,6 +992,15 @@ export async function runEmbeddedAttempt(
         "Running in local embedded mode (no gateway). Most tools work locally. Gateway-dependent tools (canvas, nodes, cron, message, sessions_send, sessions_spawn, gateway) are unavailable. Subagent kill/steer require a gateway. Do not attempt to read gateway-specific files such as sessions.json, gateway.log, or gateway.pid.",
       );
     }
+    // Deferred-tool architecture: when agents.<id>.tools.hot is set, pi-tools
+    // stashes a cold-tool index keyed by the session's lookup key. Pull it
+    // here so the agent sees what's available via tool_lookup.
+    const coldToolIndex = getColdToolIndexForSession(
+      params.sessionKey ?? `agent:${params.agentId ?? "unknown"}`,
+    );
+    if (coldToolIndex) {
+      workspaceNotes.push(coldToolIndex);
+    }
 
     const { defaultAgentId } = resolveSessionAgentIds({
       sessionKey: params.sessionKey,
@@ -1199,8 +1209,15 @@ export async function runEmbeddedAttempt(
       },
     });
     const isDefaultAgent = sessionAgentId === defaultAgentId;
+    // Local: allow per-agent `promptMode` override in config (`agents.list[].promptMode`).
+    const agentPromptModeOverride = (
+      params.config?.agents?.list?.find((a) => a?.id === sessionAgentId) as
+        | { promptMode?: "full" | "minimal" | "none" }
+        | undefined
+    )?.promptMode;
     const promptMode =
       params.promptMode ??
+      agentPromptModeOverride ??
       (isRawModelRun ? "none" : resolvePromptModeForSession(params.sessionKey));
 
     // When toolsAllow is set, use minimal prompt and strip skills catalog

@@ -20,6 +20,14 @@ import type { ExecToolDefaults } from "./bash-tools.exec-types.js";
 import type { ProcessToolDefaults } from "./bash-tools.process.js";
 import { execSchema, processSchema } from "./bash-tools.schemas.js";
 import { listChannelAgentTools } from "./channel-tools.js";
+import {
+  buildColdToolIndex,
+  bumpSessionTurn,
+  createToolLookupMetaTool,
+  getActiveUnlockedTools,
+  setColdToolIndexForSession,
+  touchUnlockedTool,
+} from "./tool-lookup.js";
 import { shouldSuppressManagedWebSearchTool } from "./codex-native-web-search.js";
 import { resolveImageSanitizationLimits } from "./image-sanitization.js";
 import type { ModelAuthMode } from "./model-auth.js";
@@ -855,8 +863,69 @@ export function createOpenClawCodingTools(options?: {
   });
   options?.recordToolPrepStage?.("deferred-followup-descriptions");
 
+  // Deferred-tool architecture:
+  //   - When agents.<id>.tools.hot is set, only hot tools are sent in the
+  //     per-turn API tools array.
+  //   - tool_lookup meta-tool is always added, returning cold-tool schemas
+  //     on demand and unlocking them for the rest of the session.
+  //   - Unlocks expire after tools.coldUnlockTtlTurns turns of non-renewal
+  //     (default 5).
+  const agentEntry = options?.config?.agents?.list?.find((a) => a?.id === agentId) as
+    | {
+        tools?: {
+          hot?: string[];
+          coldUnlockTtlTurns?: number;
+        };
+      }
+    | undefined;
+  const hotToolNames = agentEntry?.tools?.hot;
+  const ttlTurns = agentEntry?.tools?.coldUnlockTtlTurns ?? 5;
+  let filteredByHot = withDeferredFollowupDescriptions;
+  if (Array.isArray(hotToolNames) && hotToolNames.length > 0) {
+    const hotSet = new Set(hotToolNames);
+    const sessionKeyForUnlocks =
+      options?.runSessionKey || options?.sessionKey || options?.sessionId || `agent:${agentId ?? "unknown"}`;
+    const currentTurn = bumpSessionTurn(sessionKeyForUnlocks);
+    const activeUnlocks = getActiveUnlockedTools(sessionKeyForUnlocks, currentTurn, ttlTurns);
+    const lookupTool = createToolLookupMetaTool({
+      allTools: withDeferredFollowupDescriptions,
+      hotTools: hotSet,
+      sessionKey: sessionKeyForUnlocks,
+      currentTurn,
+    });
+    filteredByHot = [
+      ...withDeferredFollowupDescriptions
+        .filter((t) => hotSet.has(t.name) || activeUnlocks.has(t.name))
+        .map((tool) => {
+          if (!activeUnlocks.has(tool.name)) {
+            return tool;
+          }
+          // Wrap unlocked cold tools so each invocation refreshes the unlock
+          // TTL — "drops after N turns of non-use" rather than fixed N from
+          // lookup. Without this, sustained use of a cold tool gets cut off.
+          const originalExecute = tool.execute;
+          const wrappedExecute = (async (...args: unknown[]) => {
+            touchUnlockedTool(sessionKeyForUnlocks, tool.name, currentTurn);
+            return (originalExecute as (...a: unknown[]) => unknown).apply(tool, args);
+          }) as typeof tool.execute;
+          return { ...tool, execute: wrappedExecute } as typeof tool;
+        }),
+      lookupTool,
+    ];
+    // Stash a one-line-per-tool cold index for the system-prompt builder to
+    // pick up via getColdToolIndexForSession.
+    setColdToolIndexForSession(
+      sessionKeyForUnlocks,
+      buildColdToolIndex({
+        allTools: withDeferredFollowupDescriptions,
+        hotTools: hotSet,
+      }),
+    );
+  }
+  options?.recordToolPrepStage?.("hot-tool-filter");
+
   // NOTE: Keep canonical (lowercase) tool names here.
   // pi-ai's Anthropic OAuth transport remaps tool names to Claude Code-style names
   // on the wire and maps them back for tool dispatch.
-  return withDeferredFollowupDescriptions;
+  return filteredByHot;
 }

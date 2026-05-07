@@ -626,6 +626,14 @@ const AgentToolsSchema = z
       })
       .strict()
       .optional(),
+    // Deferred-tool fields. When `hot` is set, only those tools are sent in
+    // the LLM tools array each turn. Tools listed in `cold` (or any other
+    // registered tool not in `hot`) are deferred — their schemas are NOT in
+    // the API request. A tool_lookup meta-tool fetches the schema on demand
+    // and unlocks the cold tool for `coldUnlockTtlTurns` turns of non-use.
+    hot: z.array(z.string()).optional(),
+    cold: z.array(z.string()).optional(),
+    coldUnlockTtlTurns: z.number().int().positive().optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -891,6 +899,7 @@ export const AgentEntrySchema = z
       .optional(),
     sandbox: AgentSandboxSchema,
     params: z.record(z.string(), z.unknown()).optional(),
+    promptMode: z.enum(["full", "minimal", "none"]).optional(),
     tools: AgentToolsSchema,
     runtime: AgentRuntimeSchema,
   })
